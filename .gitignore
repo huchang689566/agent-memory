@@ -1,0 +1,27 @@
+# ── 敏感信息（API Key） ──
+.env
+
+# ── 个人数据（记忆库、会话记录） ──
+data/memories.json
+data/index.faiss
+data/sessions/
+data/tool_metadata.json
+data/tool_index.faiss
+data/recovery_dump.txt
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Docker ──
+.env
