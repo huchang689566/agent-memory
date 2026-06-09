@@ -18,10 +18,18 @@ dist/
 build/
 
 # ── IDE ──
+
+# ── 模型文件（体积大，运行时下载） ──
+models/
+
+# ── 个人简历 ──
+docs/resume_boss*.md
 .vscode/
 .idea/
 *.swp
 *.swo
 
 # ── Docker ──
-.env
+Dockerfile
+docker-compose.yml
+.dockerignore

@@ -25,6 +25,7 @@ from config import CFG
 from agent.session import SessionManager
 from mcp.client.sse import sse_client
 from mcp.client.session import ClientSession
+from security import init_guards, get_input_guard, get_output_guard
 
 from agent.agent import (
     set_mcp_session,
@@ -94,6 +95,17 @@ async def chat(
     logger.info(
         f"[会话] {'新' if is_new else '续'} session={session_id[:20]}..."
     )
+
+    # ── 安全防护：输入检测 ──
+    input_guard = get_input_guard()
+    guard_result = await input_guard.check(user_input)
+    if guard_result.blocked:
+        logger.warning(f"[安全] 输入被拦截: {guard_result.reason}")
+        return {
+            "reply": f"输入内容被安全策略拦截（{guard_result.layer}层）。如有疑问请联系管理员。",
+            "session_id": session_id,
+            "is_new_session": is_new,
+        }
 
     # 2. 设置会话上下文（供 Agent 的 is_new_conversation 工具读取）
     set_session_context(is_new, session_id)
@@ -245,6 +257,14 @@ async def cli_loop():
             if result["is_new_session"]:
                 print("[系统] 新会话")
             reply = result['reply']
+
+            # ── 安全防护：输出检测 ──
+            output_guard = get_output_guard()
+            out_result = await output_guard.check(reply)
+            if out_result.blocked:
+                logger.warning(f"[安全] 输出被拦截: {out_result.reason}")
+                reply = f"回复内容被安全策略拦截（{out_result.layer}层）。"
+
             try:
                 print(f"助手: {reply}")
             except UnicodeEncodeError:
@@ -271,6 +291,11 @@ async def main():
     init_registry(embedder=shared)
     base = [is_new_conversation, search_tools_tool]
     set_base_tools(base)
+
+    # ── 初始化安全守卫（注入系统提示词作为输出侧锚点） ──
+    from agent.prompt import build_system_prompt
+    init_guards(build_system_prompt())
+    logger.info("安全守卫初始化完成")
 
     # 2. 健康检查：Redis
     try:
