@@ -2,19 +2,18 @@
 Agent 系统 - CLI 入口
 ====================
 独立的 Agent 进程，通过 MCP 协议与 MCP Server 通信。
-不直接 import rag/ 的任何模块。
+短期记忆以 user_id 为维度，10 轮窗口 + 30 分钟 TTL，无 session 概念。
 """
 
 import json
 import logging
 import sys
-import uuid
 import time
 from typing import Optional
 
 import anyio
 
-# ── Windows CMD GBK 编码兼容：emoji 等字符用 ? 替代而非崩溃 ──
+# ── Windows CMD GBK 编码兼容 ──
 if sys.platform == "win32":
     import io
     sys.stdout = io.TextIOWrapper(
@@ -22,14 +21,14 @@ if sys.platform == "win32":
     )
 
 from config import CFG
-from agent.session import SessionManager
+from agent.session import ShortMemory
+from agent.extract_worker import ExtractWorker
 from mcp.client.sse import sse_client
 from mcp.client.session import ClientSession
 from security import init_guards, get_input_guard, get_output_guard
 
 from agent.agent import (
     set_mcp_session,
-    set_session_context,
     set_active_tools,
     run_chat,
     extract_memories_via_mcp,
@@ -38,13 +37,15 @@ from agent.agent import (
 
 logger = logging.getLogger("agent.main")
 
-session_mgr = SessionManager()
-
+memory = ShortMemory()
 MCP_URL = f"http://{CFG['mcp_host']}:{CFG['mcp_port']}/sse"
+
+# ── 后台记忆提取 Worker ──
+extract_worker = ExtractWorker(memory.redis)
 
 
 def _filter_for_mcp(messages: list[dict]) -> list[dict]:
-    """过滤消息，只保留 user text 和 assistant text，减小传输体积"""
+    """过滤消息，只保留 user text 和 assistant text"""
     cleaned = []
     for m in messages:
         role = m.get("role")
@@ -64,37 +65,45 @@ def _filter_for_mcp(messages: list[dict]) -> list[dict]:
     return cleaned
 
 
-async def chat(
-    user_id: str,
-    session_id: Optional[str],
-    user_input: str,
-) -> dict:
-    """一轮对话。返回: {"reply": str, "session_id": str, "is_new_session": bool}"""
+async def _handle_extract(user_id: str, messages: list[dict]):
+    """Worker 消费回调：执行提取管道"""
+    filtered = _filter_for_mcp(messages)
+    if len(filtered) < 4:
+        logger.info("[Worker] 消息不足，跳过提取")
+        return
+    try:
+        result = await extract_memories_via_mcp(filtered, f"auto_{user_id}", auto_commit=True)
+        logger.info(f"[Worker] 提取完成: {result}")
+    except Exception as e:
+        logger.warning(f"[Worker] 提取失败: {e}")
 
-    # 1. 会话判断：Redis key 不存在 或 值为空 → 新对话
-    is_new = False
-    messages = []
-    if session_id:
-        messages = session_mgr.load(session_id)
 
-    if not messages:
-        # key 不存在或值为空 → 新对话
-        is_new = True
-        # ── 惰性提取：补上次未提取的会话 ──
-        last_sid = session_mgr.get_last_session(user_id)
-        extracted_sid = session_mgr.get_last_extracted(user_id)
-        if last_sid and last_sid != extracted_sid:
-            logger.info(
-                f"[惰性提取] 发现未提取会话 {last_sid[:20]}...，正在补提取"
-            )
-            await end_session(user_id, last_sid)
-        # ──────────────────────────────────
-        session_id = f"sess_{uuid.uuid4().hex[:12]}"
-        messages = []
+# ── 检索规则预筛：轻量判断是否需要预取长期记忆 ──
 
-    logger.info(
-        f"[会话] {'新' if is_new else '续'} session={session_id[:20]}..."
-    )
+RETRIEVAL_KEYWORDS = [
+    "上次", "之前", "以前", "昨天", "上回", "过去",
+    "还记得", "记不记得", "你记得", "回忆",
+    "偏好", "喜欢", "爱好", "习惯",
+]
+
+
+def _should_prefetch(short_mem: list[dict], user_input: str) -> bool:
+    """规则层：零成本判断是否需要预取长期记忆"""
+    if not short_mem:
+        return True  # 新用户/短期记忆过期
+    if any(kw in user_input for kw in RETRIEVAL_KEYWORDS):
+        return True
+    return False
+
+
+async def chat(user_id: str, user_input: str) -> dict:
+    """一轮对话。返回: {"reply": str, "has_history": bool}"""
+
+    # 1. 加载短期记忆
+    messages = memory.load(user_id)
+    has_history = len(messages) > 0
+
+    logger.info(f"[记忆] 加载 {len(messages)} 条短期记忆 (user={user_id})")
 
     # ── 安全防护：输入检测 ──
     input_guard = get_input_guard()
@@ -102,90 +111,94 @@ async def chat(
     if guard_result.blocked:
         logger.warning(f"[安全] 输入被拦截: {guard_result.reason}")
         return {
-            "reply": f"输入内容被安全策略拦截（{guard_result.layer}层）。如有疑问请联系管理员。",
-            "session_id": session_id,
-            "is_new_session": is_new,
+            "reply": f"输入被安全策略拦截（{guard_result.layer}层）。",
+            "has_history": has_history,
         }
 
-    # 2. 设置会话上下文（供 Agent 的 is_new_conversation 工具读取）
-    set_session_context(is_new, session_id)
+    # ── 检索规则预筛：符合条件自动预取长期记忆注入上下文 ──
+    pre_memories = ""
+    if _should_prefetch(messages, user_input):
+        try:
+            pre_memories = await search_memories_via_mcp(
+                query=user_input, top_k=CFG["top_k_memories"]
+            )
+            if pre_memories and pre_memories.strip() != "暂无记忆":
+                logger.info(f"[记忆] 规则预筛触发，注入长期记忆")
+        except Exception as e:
+            logger.warning(f"[记忆] 预取失败: {e}")
 
-    # 3. 执行 Agent（system prompt 由 run_chat 根据 tools 自动生成）
-    result = await run_chat(messages, user_input)
+    # 2. 执行 Agent
+    result = await run_chat(messages, user_input, injected_memories=pre_memories)
 
-    # 5. 保存短期记忆 + 更新指针
-    session_mgr.save(session_id, result["messages"])
-    session_mgr.set_last_session(user_id, session_id)
+    # 3. 保存短期记忆
+    full_messages = result["messages"]
+    memory.save(user_id, full_messages)
+
+    # 4. 判断是否需要后台提取（窗口溢出 / 超时），入队异步消费
+    if extract_worker.should_extract(user_id, full_messages):
+        logger.info("[提取] 触发条件满足，消息入队")
+        new_msgs = extract_worker.get_new_messages(
+            full_messages,
+            extract_worker.get_cursor(user_id),
+        )
+        if new_msgs:
+            extract_worker.enqueue(user_id, new_msgs)
 
     return {
         "reply": result["reply"],
-        "session_id": session_id,
-        "is_new_session": is_new,
+        "has_history": has_history,
     }
 
 
-async def end_session(user_id: str, session_id: str, auto_commit: bool = True) -> dict:
-    """结束会话，通过 MCP 触发长期记忆提取。返回 {"status": str, "pending": list}"""
-    messages = session_mgr.load(session_id)
+async def extract_now(user_id: str, auto_commit: bool = True) -> dict:
+    """立即提取当前短期记忆到长期记忆"""
+    messages = memory.load(user_id)
     if not messages:
-        logger.info("[结束] 会话为空，跳过提取")
-        session_mgr.set_last_extracted(user_id, session_id)
+        logger.info("[提取] 短期记忆为空，跳过")
         return {"status": "empty", "pending": []}
 
-    logger.info(f"[结束] 会话 {session_id[:20]}... 共 {len(messages)} 条消息")
+    logger.info(f"[提取] 共 {len(messages)} 条消息")
     filtered = _filter_for_mcp(messages)
 
     try:
-        result = await extract_memories_via_mcp(filtered, session_id, auto_commit=auto_commit)
-        logger.info(f"[结束] 提取完成: {result}")
-
-        # 检查是否有待审批的冲突
-        pending = []
+        result = await extract_memories_via_mcp(
+            filtered, f"extract_{user_id}", auto_commit=auto_commit
+        )
+        logger.info(f"[提取] 完成: {result}")
         if result.startswith("PENDING_CONFLICTS:"):
             json_str = result[len("PENDING_CONFLICTS:"):].strip()
-            pending = json.loads(json_str)
-            return {"status": "pending", "pending": pending}
-
+            return {"status": "pending", "pending": json.loads(json_str)}
         return {"status": "done", "pending": []}
     except Exception as e:
-        logger.error(f"[结束] 提取失败: {e}")
+        logger.error(f"[提取] 失败: {e}")
         return {"status": "error", "pending": []}
-    finally:
-        session_mgr.set_last_extracted(user_id, session_id)
 
 
 # ── CLI ──
 
 def print_banner():
     print("=" * 60)
-    print("  Agent 记忆系统 Demo（三系统独立架构）")
+    print("  Agent 记忆系统")
     print("  Agent ─MCP SSE─► MCP Server ─HTTP─► RAG Service")
     print("=" * 60)
     print()
-    print("  /end  提取长期记忆（对话继续）")
-    print("  /new  开始新对话（注入长期记忆库）")
+    print("  /end  提取长期记忆")
     print("  /mem  查看所有长期记忆")
     print("  /quit 退出")
     print()
 
 
 async def cli_loop():
-    """异步 CLI 主循环。模拟聊天页面：打开=新会话，关闭=提取记忆"""
+    """异步 CLI 主循环"""
     print_banner()
 
     user_id = "demo_user"
     turn_count = 0
 
-    # ── 打开聊天页面 → 全新会话 ──
-    # 惰性提取：如果上次会话未提取，先补上
-    last_sid = session_mgr.get_last_session(user_id)
-    extracted_sid = session_mgr.get_last_extracted(user_id)
-    if last_sid and last_sid != extracted_sid:
-        print(f"[系统] 检测到上次对话未归档，正在提取记忆...")
-        await end_session(user_id, last_sid)
-
-    session_id = f"sess_{uuid.uuid4().hex[:12]}"
-    print(f"[系统] 新对话开始 ({session_id[:12]}...)")
+    # 先看有没有历史记忆
+    recent = memory.load(user_id)
+    if recent:
+        print(f"[系统] 恢复最近的 {len(recent)} 条对话记录")
     print()
 
     while True:
@@ -205,9 +218,8 @@ async def cli_loop():
             break
 
         if cmd == "/end":
-            # 提取长期记忆，冲突时弹确认
             print("[系统] 正在提取长期记忆...")
-            result = await end_session(user_id, session_id, auto_commit=False)
+            result = await extract_now(user_id, auto_commit=False)
             if result["status"] == "pending" and result["pending"]:
                 print(f"[系统] 检测到 {len(result['pending'])} 条冲突，请确认:")
                 for i, p in enumerate(result["pending"]):
@@ -218,22 +230,13 @@ async def cli_loop():
                         await _mcp_session.call_tool("add_memory", {
                             "content": p.get("new_content", ""),
                             "category": p.get("category", "fact"),
-                            "session_id": session_id,
+                            "session_id": f"extract_{user_id}",
                         })
                         print(f"      已更新")
                     elif ans == "q":
                         break
-            elif result["status"] == "done":
-                print("[系统] 长期记忆已归档到向量库，当前对话继续")
-            print()
-            continue
-
-        if cmd == "/new":
-            # 提取长期记忆 → 开新对话
-            await end_session(user_id, session_id)
-            session_id = f"sess_{uuid.uuid4().hex[:12]}"
-            turn_count = 0
-            print(f"[系统] 长期记忆已提取，新对话开始 ({session_id[:12]}...)")
+            else:
+                print("[系统] 长期记忆已归档")
             print()
             continue
 
@@ -252,10 +255,7 @@ async def cli_loop():
 
         turn_count += 1
         try:
-            result = await chat(user_id, session_id, user_input)
-            session_id = result["session_id"]
-            if result["is_new_session"]:
-                print("[系统] 新会话")
+            result = await chat(user_id, user_input)
             reply = result['reply']
 
             # ── 安全防护：输出检测 ──
@@ -263,12 +263,11 @@ async def cli_loop():
             out_result = await output_guard.check(reply)
             if out_result.blocked:
                 logger.warning(f"[安全] 输出被拦截: {out_result.reason}")
-                reply = f"回复内容被安全策略拦截（{out_result.layer}层）。"
+                reply = f"回复被安全策略拦截（{out_result.layer}层）。"
 
             try:
                 print(f"助手: {reply}")
             except UnicodeEncodeError:
-                # Windows CMD GBK 编码无法显示某些字符（如 emoji）
                 print(f"助手: {reply.encode('gbk', errors='replace').decode('gbk')}")
         except Exception as e:
             logger.error(f"[CLI] 对话失败: {e}")
@@ -281,32 +280,32 @@ async def main():
     logger.info("=" * 50)
     logger.info(f"[Agent] 启动，MCP Server: {MCP_URL}")
 
-    # 1. 初始化 ToolRegistry + 本地基础工具
+    # 1. 初始化 ToolRegistry + 基础工具
     from agent.tool_registry import register, set_base_tools, init as init_registry
-    from agent.agent import is_new_conversation, search_tools_tool
+    from agent.agent import search_tools_tool
     from rag.embedder import Embedder
 
     shared = Embedder(local_files_only=True)
     _ = shared.dim
     init_registry(embedder=shared)
-    base = [is_new_conversation, search_tools_tool]
+    base = [search_tools_tool]
     set_base_tools(base)
 
-    # ── 初始化安全守卫（注入系统提示词作为输出侧锚点） ──
+    # ── 初始化安全守卫 ──
     from agent.prompt import build_system_prompt
     init_guards(build_system_prompt())
     logger.info("安全守卫初始化完成")
 
     # 2. 健康检查：Redis
     try:
-        session_mgr.redis.ping()
+        memory.redis.ping()
         logger.info("Redis 连接正常")
     except Exception as e:
         logger.error(f"Redis 连接失败: {e}")
         print("请先启动 Redis")
         return
 
-    # 3. 连接 MCP Server（连接生命周期覆盖整个 CLI）
+    # 3. 连接 MCP Server
     try:
         async with sse_client(MCP_URL) as (read, write):
             async with ClientSession(read, write) as session:
@@ -321,16 +320,41 @@ async def main():
                 mcp_tools = await load_mcp_tools(session)
                 logger.info(f"[Agent] MCP adapter 加载: {[t.name for t in mcp_tools]}")
 
+                # ── 记忆写入工具不给 Agent，由后台自动管理 ──
+                AGENT_BLOCKED_TOOLS = {"add_memory", "extract_memories"}
+                agent_mcp_tools = [
+                    t for t in mcp_tools
+                    if t.name not in AGENT_BLOCKED_TOOLS
+                ]
+                logger.info(
+                    f"[Agent] 过滤后: {[t.name for t in agent_mcp_tools]}"
+                    f" (已屏蔽: {AGENT_BLOCKED_TOOLS})"
+                )
+
                 from agent.tools.gaode import load_gaode_tools
                 gaode_tools = await load_gaode_tools()
                 if gaode_tools:
                     register(gaode_tools)
 
-                all_tools = base + mcp_tools + (gaode_tools or [])
+                all_tools = base + agent_mcp_tools + (gaode_tools or [])
                 set_active_tools(all_tools)
                 logger.info(f"[Agent] 工具总数: {len(all_tools)}")
 
+                # ── 启动后台提取 Worker ──
+                import asyncio as _asyncio
+                worker_task = _asyncio.create_task(
+                    extract_worker.consume(_handle_extract)
+                )
+                logger.info("[Worker] 后台消费已启动")
+
                 await cli_loop()
+
+                # 清理
+                worker_task.cancel()
+                try:
+                    await worker_task
+                except _asyncio.CancelledError:
+                    pass
     except BaseExceptionGroup:
         pass
     except Exception as e:

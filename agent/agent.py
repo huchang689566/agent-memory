@@ -42,19 +42,6 @@ def _extract_text(result: CallToolResult) -> str:
 
 
 # ═══════════════════════════════════════
-# Agent 会话状态（供工具读取）
-# ═══════════════════════════════════════
-
-_session_context = {"is_new": False, "session_id": ""}
-
-
-def set_session_context(is_new: bool, session_id: str):
-    """由 chat() 在每轮对话前调用，设置当前会话状态"""
-    _session_context["is_new"] = is_new
-    _session_context["session_id"] = session_id
-
-
-# ═══════════════════════════════════════
 # 本地基础工具（不进 MCP）
 # ==========================================
 # 记忆工具（search_memory/add_memory/list_memories）从 MCP 加载，
@@ -63,11 +50,6 @@ def set_session_context(is_new: bool, session_id: str):
 
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
-
-
-def _is_new_conversation() -> str:
-    """检查当前是否为新对话。如果是新对话，应主动调用 search_memory 检索相关历史记忆。"""
-    return "true" if _session_context["is_new"] else "false"
 
 
 # ── search_tools：元工具，始终加载，不进向量库 ──
@@ -89,12 +71,6 @@ search_tools_tool = StructuredTool.from_function(
     args_schema=SearchToolsInput,
 )
 
-
-is_new_conversation = StructuredTool.from_function(
-    name="is_new_conversation",
-    description="检查当前是否为新对话。新对话时应主动调用 search_memory 检索历史记忆。",
-    func=_is_new_conversation,
-)
 
 
 
@@ -134,23 +110,26 @@ def create_langgraph_agent(tools=None):
 async def run_chat(
     messages: list[dict],
     user_input: str,
+    injected_memories: str = "",
 ) -> dict:
     """运行一轮 Agent 对话。
 
     两阶段模式：
     1. Agent 用基础工具执行，可能调 search_tools 发现动态工具
     2. 如果 search_tools 返回了匹配工具，重建 Agent 加入这些工具再执行
+
+    injected_memories: 规则预筛注入的长期记忆，拼入 system prompt
     """
     import time
     from agent.prompt import build_system_prompt
     from langchain_core.messages import ToolMessage
 
     t0 = time.time()
-    base_tools = _active_tools if _active_tools else [is_new_conversation, search_tools_tool]
+    base_tools = _active_tools if _active_tools else [search_tools_tool]
 
-    # ── 阶段 1：用基础工具执行 ──
+    # ── 阶段 1：拼接 prompt ──
     agent = create_langgraph_agent(base_tools)
-    prompt = build_system_prompt()
+    prompt = build_system_prompt(injected_memories=injected_memories) if injected_memories else build_system_prompt()
 
     lc_messages = [SystemMessage(content=prompt)]
     for m in messages:
